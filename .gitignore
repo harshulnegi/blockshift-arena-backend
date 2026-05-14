@@ -1,0 +1,10 @@
+node_modules/
+storage/
+.env
+.env.*
+!.env.example
+!.env.production.example
+*.log
+*.err.log
+*.out.log
+
