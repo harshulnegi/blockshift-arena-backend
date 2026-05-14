@@ -56,7 +56,7 @@ export async function upsertProfile(player) {
   }
   await ensureProfileAvatarColumn();
   const country = player.country || "GLOBAL";
-  const dbBio = bio === undefined ? null : bio;
+  const dbBio = bio === undefined ? "" : bio;
   const dbName = name === undefined ? null : name;
   const { rows } = await query(
     `insert into players(id, handle, name, country, bio, avatar_url) values($1, $2, $3, $4, $5, $6)
