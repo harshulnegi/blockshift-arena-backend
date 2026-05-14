@@ -277,10 +277,11 @@ async function verifyGoogleToken(idToken) {
 }
 
 async function verifyGoogleSignInToken(token) {
+  if (!process.env.GOOGLE_WEB_CLIENT_ID) return null;
   try {
     const ticket = await googleOAuthClient.verifyIdToken({
       idToken: token,
-      audience: process.env.GOOGLE_WEB_CLIENT_ID || undefined
+      audience: process.env.GOOGLE_WEB_CLIENT_ID
     });
     const payload = ticket.getPayload();
     const email = assertEmail(payload?.email);
