@@ -5,4 +5,4 @@ RUN npm install --omit=dev
 COPY schema.sql ./schema.sql
 COPY src ./src
 EXPOSE 8080
-CMD ["node", "src/index.js"]
+CMD ["sh", "-c", "node src/db/migrate.js && node src/index.js"]
