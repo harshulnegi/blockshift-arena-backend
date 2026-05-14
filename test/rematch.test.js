@@ -5,9 +5,28 @@ import jwt from "jsonwebtoken";
 import { io as Client } from "socket.io-client";
 import { attachSocketServer } from "../src/socket.js";
 import { detectCountryFromRequest } from "../src/services/geo.js";
-import { findProfile, leaderboard, persistMatch, updateProfileAvatar, upsertProfile, MAX_AVATAR_BYTES, MAX_BIO_WORDS, MIN_TROPHIES, STARTING_TROPHIES } from "../src/services/matchStore.js";
+import { findProfile, leaderboard, persistMatch, toMatchPersistenceParams, updateProfileAvatar, upsertProfile, MAX_AVATAR_BYTES, MAX_BIO_WORDS, MIN_TROPHIES, STARTING_TROPHIES } from "../src/services/matchStore.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_only";
+
+test("match persistence sends replay as jsonb-safe JSON", () => {
+  const state = {
+    id: "jsonb_replay_test",
+    mode: "ranked",
+    ranked: true,
+    status: "active",
+    winner: null,
+    players: {
+      south: { id: "south_jsonb", handle: "SouthJson" },
+      north: { id: "north_jsonb", handle: "NorthJson" }
+    },
+    replay: [{ n: 1, side: "south", action: { type: "move", row: 7, col: 4 }, at: 123 }]
+  };
+  const params = toMatchPersistenceParams(state);
+  assert.equal(typeof params[4], "string");
+  assert.equal(typeof params[5], "string");
+  assert.deepEqual(JSON.parse(params[5]), state.replay);
+});
 
 test("new ranked profiles start at 100 trophies and never go below zero", async () => {
   const suffix = Math.random().toString(36).slice(2, 8);

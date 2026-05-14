@@ -170,11 +170,22 @@ export async function persistMatch(state) {
   if (state.status === "finished" && state.ranked && !state.trophyDelta) persistedState = await applyRankedResult(state);
   await query(
     `insert into matches(id, mode, ranked, winner_id, state, replay)
-     values($1, $2, $3, $4, $5, $6)
+     values($1, $2, $3, $4, $5::jsonb, $6::jsonb)
      on conflict(id) do update set winner_id = excluded.winner_id, state = excluded.state, replay = excluded.replay, updated_at = now()`,
-    [persistedState.id, persistedState.mode, persistedState.ranked, persistedState.winner ? persistedState.players[persistedState.winner].id : null, persistedState, persistedState.replay]
+    toMatchPersistenceParams(persistedState)
   );
   return persistedState;
+}
+
+export function toMatchPersistenceParams(state) {
+  return [
+    state.id,
+    state.mode,
+    state.ranked,
+    state.winner ? state.players[state.winner].id : null,
+    JSON.stringify(state),
+    JSON.stringify(state.replay || [])
+  ];
 }
 
 function applyMemoryRankedResult(state) {
