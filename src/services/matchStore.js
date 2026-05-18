@@ -18,6 +18,8 @@ const PROFILE_STORE = path.join(STORAGE_DIR, "profiles.json");
 const memoryProfiles = new Map();
 const memoryMatches = new Map();
 const memoryRatedMatches = new Set();
+const LEADERBOARD_CACHE_MS = Math.max(0, Number(process.env.LEADERBOARD_CACHE_MS || 5000));
+const leaderboardCache = new Map();
 let avatarColumnReady = false;
 let memoryProfilesLoaded = false;
 
@@ -52,6 +54,7 @@ export async function upsertProfile(player) {
       });
     }
     await saveMemoryProfiles();
+    clearLeaderboardCache();
     return toPublicProfile(memoryProfiles.get(player.id));
   }
   await ensureProfileAvatarColumn();
@@ -64,6 +67,7 @@ export async function upsertProfile(player) {
      returning id, handle, name, rating, wins, losses, country, bio, avatar_url, created_at`,
     [player.id, player.handle, dbName, country, dbBio, avatarUrl || null]
   );
+  clearLeaderboardCache();
   return toPublicProfile(rows[0]);
 }
 
@@ -92,6 +96,7 @@ export async function updateProfileAvatar(player, avatarDataUrl, publicBaseUrl =
     };
     memoryProfiles.set(player.id, next);
     await saveMemoryProfiles();
+    clearLeaderboardCache();
     return toPublicProfile(next);
   }
   await ensureProfileAvatarColumn();
@@ -101,6 +106,7 @@ export async function updateProfileAvatar(player, avatarDataUrl, publicBaseUrl =
      returning id, handle, name, rating, wins, losses, country, bio, avatar_url, created_at`,
     [player.id, player.handle || "Neon Pilot", player.name || player.handle || "Neon Pilot", avatarUrl]
   );
+  clearLeaderboardCache();
   return toPublicProfile(rows[0]);
 }
 
@@ -164,6 +170,7 @@ export async function persistMatch(state) {
       await saveMemoryProfiles();
     }
     memoryMatches.set(persistedState.id, persistedState);
+    if (persistedState.status === "finished" && persistedState.ranked) clearLeaderboardCache();
     return persistedState;
   }
   let persistedState = state;
@@ -174,6 +181,7 @@ export async function persistMatch(state) {
      on conflict(id) do update set winner_id = excluded.winner_id, state = excluded.state, replay = excluded.replay, updated_at = now()`,
     toMatchPersistenceParams(persistedState)
   );
+  if (persistedState.status === "finished" && persistedState.ranked) clearLeaderboardCache();
   return persistedState;
 }
 
@@ -226,13 +234,20 @@ async function applyRankedResult(state) {
 }
 
 export async function leaderboard(limit = 100) {
+  const cappedLimit = Math.min(Math.max(Number(limit || 100), 1), 500);
+  const cached = cachedLeaderboard(cappedLimit);
+  if (cached) return cached;
+  let rows;
   if (!process.env.DATABASE_URL) {
     await loadMemoryProfilesOnce();
-    return [...memoryProfiles.values()].filter(includePublicProfile).sort((a, b) => b.rating - a.rating).slice(0, limit).map(toPublicProfile);
+    rows = [...memoryProfiles.values()].filter(includePublicProfile).sort((a, b) => b.rating - a.rating).slice(0, cappedLimit).map(toPublicProfile);
+  } else {
+    await ensureProfileAvatarColumn();
+    const result = await query("select id, handle, name, rating, wins, losses, country, bio, avatar_url, created_at from players order by rating desc limit $1", [cappedLimit]);
+    rows = result.rows.filter(includePublicProfile).map(toPublicProfile);
   }
-  await ensureProfileAvatarColumn();
-  const { rows } = await query("select id, handle, name, rating, wins, losses, country, bio, avatar_url, created_at from players order by rating desc limit $1", [limit]);
-  return rows.filter(includePublicProfile).map(toPublicProfile);
+  rememberLeaderboard(cappedLimit, rows);
+  return rows;
 }
 
 export async function searchProfiles(searchText, limit = 10, excludeId = "") {
@@ -315,6 +330,7 @@ export async function deletePlayerData(playerId) {
     memoryRatedMatches.delete(cleanId);
     await deleteAvatarFile(existing?.avatarUrl);
     await saveMemoryProfiles();
+    clearLeaderboardCache();
     return true;
   }
   await ensureProfileAvatarColumn();
@@ -328,7 +344,27 @@ export async function deletePlayerData(playerId) {
   );
   await query("delete from players where id = $1", [cleanId]);
   await deleteAvatarFile(existing?.avatarUrl);
+  clearLeaderboardCache();
   return true;
+}
+
+function cachedLeaderboard(limit) {
+  if (LEADERBOARD_CACHE_MS <= 0) return null;
+  const cached = leaderboardCache.get(limit);
+  if (!cached || cached.expiresAt <= Date.now()) return null;
+  return cached.rows.map((row) => ({ ...row }));
+}
+
+function rememberLeaderboard(limit, rows) {
+  if (LEADERBOARD_CACHE_MS <= 0) return;
+  leaderboardCache.set(limit, {
+    expiresAt: Date.now() + LEADERBOARD_CACHE_MS,
+    rows: rows.map((row) => ({ ...row }))
+  });
+}
+
+function clearLeaderboardCache() {
+  leaderboardCache.clear();
 }
 
 async function ensureProfileAvatarColumn() {

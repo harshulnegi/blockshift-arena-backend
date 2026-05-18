@@ -3,6 +3,7 @@ import { chooseAiAction } from "../game/ai.js";
 import { createInitialState, applyAction, legalMoves } from "../game/rules.js";
 import { requireAuth, signAppToken } from "../middleware/auth.js";
 import { detectCountryFromRequest, resolveProfileCountry } from "../services/geo.js";
+import { cachedHiveSnapshot, hiveStats, publicHiveEdge } from "../services/hive.js";
 import {
   assertProfileHandleAvailable,
   cleanAuthHandle,
@@ -110,6 +111,21 @@ export function createApiRouter() {
   router.get("/leaderboard", async (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
     res.json({ players: await leaderboard(limit) });
+  });
+
+  router.get("/hive/status", (req, res) => {
+    res.json({ edge: publicHiveEdge(resolveProfileCountry(req, req.query.region, req.query.localeCountry)), stats: hiveStats() });
+  });
+
+  router.get("/hive/snapshot", async (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit || 30), 1), 50);
+    const region = resolveProfileCountry(req, req.query.region, req.query.localeCountry).toLowerCase();
+    const snapshot = await cachedHiveSnapshot(`leaderboard:${region}:${limit}`, async () => ({
+      type: "leaderboard",
+      region,
+      players: await leaderboard(limit)
+    }));
+    res.json(snapshot);
   });
 
   router.get("/profile/public", async (req, res) => {

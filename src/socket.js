@@ -1,14 +1,20 @@
 import { Server } from "socket.io";
+import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import { createInitialState, applyAction, finishByClockTimeout, legalMoves, normalizeBallSkin, opponentOf, remainingClockMs } from "./game/rules.js";
 import { chooseAiAction } from "./game/ai.js";
 import { Matchmaker } from "./services/matchmaker.js";
-import { findProfile, persistMatch, upsertProfile } from "./services/matchStore.js";
+import { cachedHiveSnapshot, hiveCapabilities, hiveReceiptsForMatch, hiveStats, publicHiveEdge, registerHiveNode, rememberHiveReceipts, unregisterHiveSocket } from "./services/hive.js";
+import { findProfile, leaderboard, persistMatch, upsertProfile } from "./services/matchStore.js";
 
 const matches = new Map();
 const matchClockTimers = new Map();
 const socketsByPlayer = new Map();
 const spectatorsByMatch = new Map();
+const meshConfigByMatch = new Map();
+const meshReceiptsByMatch = new Map();
+const meshChainsByMatch = new Map();
+const meshFallbackByMatch = new Map();
 const customRooms = new Map();
 const ROOM_TTL_MS = 15 * 60 * 1000;
 const REMATCH_TTL_MS = 60 * 1000;
@@ -22,18 +28,34 @@ const friendChallenges = new Map();
 const friendChallengeTimers = new Map();
 const friendChallengeRejectCounts = new Map();
 const friendMessages = new Map();
+let activeMatchRedis = null;
+const ACTIVE_MATCH_TTL_SECONDS = Number(process.env.ACTIVE_MATCH_TTL_SECONDS || 60 * 60 * 6);
 const CHALLENGE_RESPONSE_MS = 10 * 1000;
 const CHALLENGE_REJECT_COOLDOWN_MS = 5 * 1000;
 const CHALLENGE_EXTENDED_RESPONSE_MS = 20 * 1000;
 const CHALLENGE_REJECT_THRESHOLD = 3;
+const DEFAULT_STUN_URLS = ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"];
+const SPECTATOR_STATE_INTERVAL_MS = Number(process.env.SPECTATOR_STATE_INTERVAL_MS || 1200);
+const ACTIVE_MATCH_CACHE_FLUSH_MS = Math.max(0, Number(process.env.ACTIVE_MATCH_CACHE_FLUSH_MS || 750));
+const MESH_RECEIPT_WINDOW = Math.max(8, Math.min(120, Number(process.env.MESH_RECEIPT_WINDOW || 32)));
+const spectatorStateLastSentAt = new Map();
+const pendingActiveMatchCacheSaves = new Map();
+const activeMatchCacheTimers = new Map();
 
-export function attachSocketServer(httpServer, redis) {
+export function attachSocketServer(httpServer, redis, options = {}) {
+  activeMatchRedis = redis || null;
+  const matchmakerRedis = Object.prototype.hasOwnProperty.call(options, "matchmakerRedis")
+    ? options.matchmakerRedis
+    : redis;
   const io = new Server(httpServer, {
     cors: { origin: process.env.CLIENT_ORIGIN || "*", credentials: true },
+    serveClient: false,
+    httpCompression: false,
+    perMessageDeflate: false,
     pingInterval: 10000,
     pingTimeout: 7000
   });
-  const matchmaker = new Matchmaker(redis);
+  const matchmaker = new Matchmaker(matchmakerRedis);
 
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token;
@@ -47,7 +69,7 @@ export function attachSocketServer(httpServer, redis) {
 
   io.on("connection", (socket) => {
     socketsByPlayer.set(socket.user.id, socket.id);
-    socket.emit("presence:ready", { playerId: socket.user.id, serverTime: Date.now() });
+    socket.emit("presence:ready", { playerId: socket.user.id, serverTime: Date.now(), mesh: { version: 1, signaling: true, serverFallback: true }, hive: hiveCapabilities() });
     socket.broadcast.emit("presence:online", { playerId: socket.user.id, handle: socket.user.handle, at: Date.now() });
     deliverPendingRematches(io, socket.user.id, socket.user.handle);
     deliverPendingFriendRequests(io, socket);
@@ -76,6 +98,7 @@ export function attachSocketServer(httpServer, redis) {
           matchId: state.id,
           side: sideForPlayer(state, socket.user.id),
           state,
+          mesh: activeMeshConfig(state.id),
           legalMoves: legalMoves(state, state.turn)
         });
       }
@@ -90,6 +113,7 @@ export function attachSocketServer(httpServer, redis) {
           bot: true,
           side: sideForPlayer(state, socket.user.id),
           state,
+          mesh: activeMeshConfig(state.id),
           legalMoves: legalMoves(state, state.turn)
         });
       }
@@ -145,11 +169,12 @@ export function attachSocketServer(httpServer, redis) {
       socket.join(`room:${code}`);
       const guest = playerFromSocket(socket, payload, profile);
       const state = startMatch(io, room.ticket, [guest, room.ticket.player]);
-      const matchedPayload = { code, matchId: state.id, state, players: state.players };
+      const matchedPayload = { code, matchId: state.id, state, players: state.players, mesh: activeMeshConfig(state.id) };
+      console.log("ArenaP2P room matched", { code, matchId: state.id, mesh: redactedMeshConfig(matchedPayload.mesh) });
       io.to(`room:${code}`).emit("room:matched", matchedPayload);
       io.to(`room:${code}`).emit("room:closed", { code, matchId: state.id });
       broadcastRoomList(io);
-      ack?.({ ok: true, code, matchId: state.id, side: sideForPlayer(state, socket.user.id), state, players: state.players });
+      ack?.({ ok: true, code, matchId: state.id, side: sideForPlayer(state, socket.user.id), state, players: state.players, mesh: activeMeshConfig(state.id) });
     });
 
     socket.on("room:cancel", (payload = {}, ack) => {
@@ -164,7 +189,7 @@ export function attachSocketServer(httpServer, redis) {
     });
 
     socket.on("match:join", async ({ matchId, spectator = false }, ack) => {
-      const state = await settleClockTimeout(io, matchId) || matches.get(matchId);
+      const state = await settleClockTimeout(io, matchId) || await loadActiveMatch(matchId);
       if (!state) return ack?.({ error: "match_not_found" });
       removeSpectator(io, socket, socket.data?.spectatingMatchId);
       socket.join(`match:${matchId}`);
@@ -174,11 +199,13 @@ export function attachSocketServer(httpServer, redis) {
       if (watching) {
         spectatorSet(matchId).add(socket.id);
         socket.data.spectatingMatchId = matchId;
+        socket.join(spectatorRoom(matchId));
       } else {
         socket.data.spectatingMatchId = "";
+        socket.join(playerRoom(matchId));
       }
       const publicState = stateWithSpectators(matchId, state);
-      ack?.({ state: publicState, side, spectator: watching, legalMoves: side ? legalMoves(state, side) : [] });
+      ack?.({ matchId, state: publicState, side, spectator: watching, mesh: activeMeshConfig(matchId), legalMoves: side ? legalMoves(state, side) : [] });
       if (side) socket.to(`match:${matchId}`).emit("match:playerReconnected", { matchId, side, handle: state.players[side].handle, at: Date.now() });
       if (watching) socket.to(`match:${matchId}`).emit("spectator:joined", { handle: socket.user.handle });
       emitSpectatorCount(io, matchId);
@@ -389,38 +416,187 @@ export function attachSocketServer(httpServer, redis) {
           ballSkin: offer.fromBallSkin
         }
       ]);
-      const acceptedPayload = { challengeId: offer.id, matchId: state.id, state, acceptedBy: socket.user.handle, at: Date.now() };
+      const acceptedPayload = { challengeId: offer.id, matchId: state.id, state, mesh: activeMeshConfig(state.id), acceptedBy: socket.user.handle, at: Date.now() };
       if (requesterSocketId) io.to(requesterSocketId).emit("friends:challengeAccepted", acceptedPayload);
-      ack?.({ ok: true, accepted: true, matchId: state.id, state });
+      ack?.({ ok: true, accepted: true, matchId: state.id, state, mesh: activeMeshConfig(state.id) });
       await emitSocialSnapshotToPlayer(io, offer.fromId);
       await emitSocialSnapshotToPlayer(io, offer.toId);
     });
 
-    socket.on("match:action", async ({ matchId, clientSeq, action }, ack) => {
-      const state = await settleClockTimeout(io, matchId) || matches.get(matchId);
+    socket.on("match:action", async ({ matchId, clientSeq, action, meshEnvelope }, ack) => {
+      const state = await settleClockTimeout(io, matchId) || await loadActiveMatch(matchId);
       if (!state) return ack?.({ error: "match_not_found" });
       if (state.status !== "active") return ack?.({ ok: true, state: stateWithSpectators(matchId, state), legalMoves: [] });
       const side = Object.entries(state.players).find(([, p]) => p.id === socket.user.id)?.[0];
       if (!side) return ack?.({ error: "not_a_player" });
+      const meshReceipt = verifyMeshEnvelope(state, side, action, clientSeq, meshEnvelope);
+      if (state.ranked && !meshReceipt.verified) {
+        socket.emit("antiCheat:rejected", { reason: "invalid_arena_hive_receipt", serverState: state });
+        return ack?.({ error: "invalid_arena_hive_receipt" });
+      }
       try {
         const next = applyAction(state, side, action);
         const finalState = next.status === "active" && next.players[next.turn].id.startsWith("bot_")
           ? applyAction(next, next.turn, chooseAiAction(next, next.turn, "hard").action)
           : next;
-        const persistedState = await persistMatch(finalState);
-        matches.set(matchId, persistedState);
+        meshReceipt.serverSeq = finalState.replay.length;
+        const proofState = stateWithMeshReceipt(finalState, meshReceipt);
+        commitMeshReceipt(matchId, meshReceipt, proofState);
+        const storedState = await storeMatchState(proofState);
         scheduleMatchClock(io, matchId);
-        const publicState = stateWithSpectators(matchId, persistedState);
-        io.to(`match:${matchId}`).emit("match:state", { matchId, state: publicState, lastAction: action, clientSeq });
-        ack?.({ ok: true, state: publicState, legalMoves: persistedState.status === "active" ? legalMoves(persistedState, persistedState.turn) : [] });
+        const publicState = stateWithSpectators(matchId, storedState);
+        emitMatchState(io, matchId, { matchId, state: publicState, mesh: activeMeshConfig(matchId), lastAction: action, clientSeq, meshReceipt }, storedState);
+        io.to(`match:${matchId}`).emit("mesh:receipt", meshReceipt);
+        ack?.({ ok: true, state: publicState, legalMoves: storedState.status === "active" ? legalMoves(storedState, storedState.turn) : [] });
       } catch (error) {
         ack?.({ error: error.message });
         socket.emit("antiCheat:rejected", { reason: error.message, serverState: state });
       }
     });
 
+    socket.on("mesh:ready", async (payload = {}, ack) => {
+      const matchId = String(payload.matchId || "").trim();
+      const state = await loadActiveMatch(matchId);
+      if (!state) return ack?.({ error: "match_not_found" });
+      const side = sideForUser(state, socket.user);
+      if (!side) return ack?.({ error: "not_a_player" });
+      socket.join(`mesh:${matchId}`);
+      socket.data.meshMatchId = matchId;
+      const event = {
+        matchId,
+        playerId: socket.user.id,
+        side,
+        handle: state.players[side].handle,
+        nodeId: cleanId(payload.nodeId, 64),
+        capabilities: safeObject(payload.capabilities),
+        at: Date.now()
+      };
+      socket.to(`mesh:${matchId}`).emit("mesh:peerReady", event);
+      console.log("ArenaP2P mesh ready", { matchId, playerId: socket.user.id, side, nodeId: event.nodeId });
+      ack?.({ ok: true, matchId, mesh: activeMeshConfig(matchId) });
+    });
+
+    socket.on("mesh:signal", async (payload = {}, ack) => {
+      const matchId = String(payload.matchId || "").trim();
+      const state = await loadActiveMatch(matchId);
+      if (!state) return ack?.({ error: "match_not_found" });
+      const fromSide = sideForUser(state, socket.user);
+      if (!fromSide) return ack?.({ error: "not_a_player" });
+      const toPlayerId = cleanId(payload.toPlayerId, 128);
+      const toSide = sideForPlayer(state, toPlayerId);
+      if (!toSide || toSide === fromSide) return ack?.({ error: "invalid_peer" });
+      const targetSocketId = socketsByPlayer.get(toPlayerId);
+      if (!targetSocketId) return ack?.({ error: "peer_offline" });
+      console.log("ArenaP2P signal", {
+        matchId,
+        fromPlayerId: socket.user.id,
+        toPlayerId,
+        type: cleanSignalType(payload.type),
+        seq: Number(payload.seq) || 0
+      });
+      io.to(targetSocketId).emit("mesh:signal", {
+        matchId,
+        fromPlayerId: socket.user.id,
+        fromSide,
+        type: cleanSignalType(payload.type),
+        seq: Number(payload.seq) || 0,
+        data: safeObject(payload.data),
+        at: Date.now()
+      });
+      ack?.({ ok: true });
+    });
+
+    socket.on("mesh:fallback", async (payload = {}, ack) => {
+      const matchId = String(payload.matchId || "").trim();
+      const state = await loadActiveMatch(matchId);
+      if (!state) return ack?.({ error: "match_not_found" });
+      const side = sideForUser(state, socket.user);
+      if (!side) return ack?.({ error: "not_a_player" });
+      const event = {
+        matchId,
+        side,
+        reason: cleanReason(payload.reason),
+        at: Date.now()
+      };
+      meshFallbackByMatch.set(matchId, event);
+      await saveActiveMatch(state);
+      io.to(`match:${matchId}`).emit("mesh:fallback", event);
+      ack?.({ ok: true });
+    });
+
+    socket.on("mesh:receipt", async (payload = {}, ack) => {
+      const matchId = String(payload.matchId || "").trim();
+      const state = await loadActiveMatch(matchId);
+      if (!state) return ack?.({ error: "match_not_found" });
+      const side = sideForUser(state, socket.user);
+      if (!side) return ack?.({ error: "not_a_player" });
+      const receipt = sanitizeMeshReceipt(matchId, side, payload.receipt || payload);
+      rememberMeshReceipt(matchId, receipt);
+      await saveActiveMatch(state);
+      socket.to(`match:${matchId}`).emit("mesh:receipt", receipt);
+      ack?.({ ok: true });
+    });
+
+    socket.on("hive:ready", (payload = {}, ack) => {
+      const node = registerHiveNode({
+        socketId: socket.id,
+        playerId: socket.user.id,
+        handle: socket.user.handle,
+        payload
+      });
+      socket.data.hiveRegion = node.region;
+      socket.join(`hive:${node.region}`);
+      const edge = publicHiveEdge(node.region);
+      socket.emit("hive:edge", { edge, node, stats: hiveStats(), at: Date.now() });
+      ack?.({ ok: true, edge, node, stats: hiveStats() });
+    });
+
+    socket.on("hive:edgeProbe", (payload = {}, ack) => {
+      const region = cleanReason(payload.region || socket.data.hiveRegion || "global").toLowerCase().replace(/\s+/g, "-");
+      ack?.({ ok: true, edge: publicHiveEdge(region), stats: hiveStats(), serverTime: Date.now(), clientTime: payload.clientTime || 0 });
+    });
+
+    socket.on("hive:snapshot", async (payload = {}, ack) => {
+      const limit = Math.min(Math.max(Number(payload.limit || 30), 1), 50);
+      const region = cleanReason(payload.region || socket.data.hiveRegion || "global").toLowerCase().replace(/\s+/g, "-");
+      const snapshot = await cachedHiveSnapshot(`socket:leaderboard:${region}:${limit}`, async () => ({
+        type: "leaderboard",
+        region,
+        players: await leaderboard(limit),
+        rooms: publicRoomList(),
+        stats: hiveStats()
+      }));
+      ack?.({ ok: true, snapshot });
+    });
+
+    socket.on("hive:gossip", (payload = {}, ack) => {
+      const receipts = Array.isArray(payload.receipts)
+        ? payload.receipts
+        : payload.receipt
+          ? [payload.receipt]
+          : [];
+      const result = rememberHiveReceipts({
+        matchId: payload.matchId,
+        fromPlayerId: socket.user.id,
+        receipts
+      });
+      if (result.accepted > 0) {
+        io.to(`hive:${socket.data.hiveRegion || "global"}`).emit("hive:gossip", {
+          matchId: cleanId(payload.matchId, 128),
+          fromPlayerId: socket.user.id,
+          receipts: result.receipts,
+          at: Date.now()
+        });
+      }
+      ack?.({ ok: true, accepted: result.accepted });
+    });
+
+    socket.on("hive:receipts", (payload = {}, ack) => {
+      ack?.({ ok: true, matchId: cleanId(payload.matchId, 128), receipts: hiveReceiptsForMatch(payload.matchId, payload.limit) });
+    });
+
     socket.on("match:leave", async ({ matchId } = {}, ack) => {
-      const state = matches.get(matchId);
+      const state = await loadActiveMatch(matchId);
       if (!state) return ack?.({ error: "match_not_found" });
       if (socket.data?.spectatingMatchId === String(matchId || "").trim()) {
         removeSpectator(io, socket, matchId);
@@ -432,8 +608,7 @@ export function attachSocketServer(httpServer, redis) {
         return ack?.({ ok: true, spectator: true });
       }
       const next = finishByForfeit(state, side);
-      const persistedState = await persistMatch(next);
-      matches.set(matchId, persistedState);
+      const persistedState = await storeMatchState(next);
       clearMatchClock(matchId);
       const publicState = stateWithSpectators(matchId, persistedState);
       socket.to(`match:${matchId}`).emit("match:playerLeft", {
@@ -449,9 +624,9 @@ export function attachSocketServer(httpServer, redis) {
       ack?.({ ok: true, state: publicState });
     });
 
-    socket.on("match:rematchOffer", ({ matchId } = {}, ack) => {
+    socket.on("match:rematchOffer", async ({ matchId } = {}, ack) => {
       pruneExpiredRematches(io);
-      const state = matches.get(matchId);
+      const state = await loadActiveMatch(matchId);
       if (!state) return ack?.({ error: "match_not_found" });
       const side = sideForUser(state, socket.user);
       if (!side) return ack?.({ error: "not_a_player" });
@@ -460,7 +635,7 @@ export function attachSocketServer(httpServer, redis) {
       const existing = rematchOffers.get(matchId);
       if (existing && sameRematchRecipient(existing, socket.user)) {
         try {
-          const nextState = acceptRematch(io, matchId, existing, socket.user);
+          const nextState = await acceptRematch(io, matchId, existing, socket.user);
           return ack?.({ ok: true, accepted: true, newMatchId: nextState.id, state: nextState });
         } catch (error) {
           return ack?.({ error: error.message });
@@ -484,7 +659,7 @@ export function attachSocketServer(httpServer, redis) {
       ack?.({ ok: true, pending: true, expiresAt: offer.expiresAt });
     });
 
-    socket.on("match:rematchRespond", ({ matchId, accepted } = {}, ack) => {
+    socket.on("match:rematchRespond", async ({ matchId, accepted } = {}, ack) => {
       pruneExpiredRematches(io);
       const offer = rematchOffers.get(matchId);
       if (!offer) return ack?.({ error: "rematch_offer_not_found" });
@@ -497,7 +672,7 @@ export function attachSocketServer(httpServer, redis) {
         return ack?.({ ok: true, accepted: false });
       }
       try {
-        const nextState = acceptRematch(io, matchId, offer, socket.user);
+        const nextState = await acceptRematch(io, matchId, offer, socket.user);
         ack?.({ ok: true, accepted: true, newMatchId: nextState.id, state: nextState });
       } catch (error) {
         ack?.({ error: error.message });
@@ -511,16 +686,17 @@ export function attachSocketServer(httpServer, redis) {
       ack?.({ ok: true });
     });
 
-    socket.on("match:chat", ({ matchId, message } = {}, ack) => {
+    socket.on("match:chat", async ({ matchId, message, clientId } = {}, ack) => {
       const normalizedMatchId = String(matchId || "").trim();
-      const state = matches.get(normalizedMatchId);
+      const state = await loadActiveMatch(normalizedMatchId);
       if (!state) return ack?.({ error: "match_not_found" });
       const side = sideForPlayer(state, socket.user.id);
       if (!side) return ack?.({ error: "not_a_player" });
       const clean = String(message || "").replace(/\s+/g, " ").trim().slice(0, 160);
       if (!clean) return ack?.({ error: "empty_message" });
+      const safeClientId = cleanId(clientId, 96);
       const payload = {
-        id: `mc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        id: safeClientId || `mc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
         matchId: normalizedMatchId,
         fromId: socket.user.id,
         fromHandle: socket.user.handle || state.players[side].handle,
@@ -535,6 +711,7 @@ export function attachSocketServer(httpServer, redis) {
     socket.on("disconnect", async () => {
       await cancelQueuedTicket(matchmaker, socket.user.id);
       removeSpectator(io, socket, socket.data?.spectatingMatchId);
+      unregisterHiveSocket(socket.id);
       notifyPlayerDisconnected(socket);
       removeHostedRooms(io, socket.user.id);
       if (socketsByPlayer.get(socket.user.id) === socket.id) socketsByPlayer.delete(socket.user.id);
@@ -586,6 +763,364 @@ function publicPlayer(player) {
     avatarUrl: player.avatarUrl || null,
     ballSkin: normalizeBallSkin(player.ballSkin)
   };
+}
+
+function installMeshForMatch(state, ticket = {}) {
+  const mesh = createMeshConfig(state, ticket);
+  meshConfigByMatch.set(state.id, mesh);
+  meshReceiptsByMatch.set(state.id, []);
+  meshChainsByMatch.set(state.id, { south: "genesis", north: "genesis" });
+  meshFallbackByMatch.delete(state.id);
+  return mesh;
+}
+
+function activeMeshConfig(matchId) {
+  const mesh = meshConfigByMatch.get(matchId);
+  if (!mesh) return null;
+  const fallback = meshFallbackByMatch.get(matchId);
+  return {
+    ...mesh,
+    ...iceCapabilities(matchId),
+    fallbackActive: Boolean(fallback),
+    fallbackReason: fallback?.reason || "",
+    fallbackAt: fallback?.at || 0
+  };
+}
+
+function activeMatchKey(matchId) {
+  return `blockshift:active-match:${String(matchId || "").trim()}`;
+}
+
+async function saveActiveMatch(state, options = {}) {
+  if (!state?.id) return state;
+  matches.set(state.id, state);
+  if (!activeMatchRedis) return state;
+  const immediate = Boolean(options.immediate) || state.status !== "active" || ACTIVE_MATCH_CACHE_FLUSH_MS <= 0;
+  if (!immediate) {
+    pendingActiveMatchCacheSaves.set(state.id, state);
+    if (!activeMatchCacheTimers.has(state.id)) {
+      const timer = setTimeout(() => {
+        activeMatchCacheTimers.delete(state.id);
+        flushActiveMatchCache(state.id).catch((error) => {
+          console.warn("active match cache flush failed", { matchId: state.id, error: error.message });
+        });
+      }, ACTIVE_MATCH_CACHE_FLUSH_MS);
+      timer.unref?.();
+      activeMatchCacheTimers.set(state.id, timer);
+    }
+    return state;
+  }
+  clearActiveMatchCacheTimer(state.id);
+  pendingActiveMatchCacheSaves.delete(state.id);
+  await writeActiveMatchCache(state);
+  return state;
+}
+
+async function flushActiveMatchCache(matchId) {
+  const normalized = String(matchId || "").trim();
+  if (!normalized || !activeMatchRedis) return null;
+  const state = pendingActiveMatchCacheSaves.get(normalized);
+  if (!state) return null;
+  pendingActiveMatchCacheSaves.delete(normalized);
+  await writeActiveMatchCache(state);
+  return state;
+}
+
+async function writeActiveMatchCache(state) {
+  if (!state?.id || !activeMatchRedis) return state;
+  const document = {
+    state,
+    mesh: meshConfigByMatch.get(state.id) || null,
+    fallback: meshFallbackByMatch.get(state.id) || null,
+    receipts: (meshReceiptsByMatch.get(state.id) || []).slice(-MESH_RECEIPT_WINDOW),
+    chains: meshChainsByMatch.get(state.id) || null,
+    savedAt: Date.now()
+  };
+  try {
+    await activeMatchRedis.set(activeMatchKey(state.id), JSON.stringify(document), "EX", ACTIVE_MATCH_TTL_SECONDS);
+  } catch (error) {
+    console.warn("active match cache save failed", { matchId: state.id, error: error.message });
+  }
+  return state;
+}
+
+function clearActiveMatchCacheTimer(matchId) {
+  const normalized = String(matchId || "").trim();
+  const timer = activeMatchCacheTimers.get(normalized);
+  if (timer) clearTimeout(timer);
+  activeMatchCacheTimers.delete(normalized);
+}
+
+async function storeMatchState(state) {
+  if (!state?.id) return state;
+  const shouldPersist = state.status && state.status !== "active";
+  const storedState = shouldPersist ? await persistMatch(state) : state;
+  await saveActiveMatch(storedState, { immediate: shouldPersist });
+  if (shouldPersist) spectatorStateLastSentAt.delete(storedState.id);
+  return storedState;
+}
+
+async function loadActiveMatch(matchId) {
+  const normalized = String(matchId || "").trim();
+  if (!normalized) return null;
+  const memoryState = matches.get(normalized);
+  if (memoryState) return memoryState;
+  if (!activeMatchRedis) return null;
+  try {
+    const raw = await activeMatchRedis.get(activeMatchKey(normalized));
+    if (!raw) return null;
+    const document = JSON.parse(raw);
+    const state = document?.state;
+    if (!state?.id) return null;
+    matches.set(state.id, state);
+    if (document.mesh) meshConfigByMatch.set(state.id, document.mesh);
+    if (document.fallback) meshFallbackByMatch.set(state.id, document.fallback);
+    if (Array.isArray(document.receipts)) meshReceiptsByMatch.set(state.id, document.receipts.slice(-MESH_RECEIPT_WINDOW));
+    if (document.chains && typeof document.chains === "object") meshChainsByMatch.set(state.id, document.chains);
+    return state;
+  } catch (error) {
+    console.warn("active match cache load failed", { matchId: normalized, error: error.message });
+    return null;
+  }
+}
+
+function createMeshConfig(state, ticket = {}) {
+  const botMatch = hasBotPlayer(state);
+  const mode = String(ticket.mode || state.mode || "casual").toLowerCase();
+  const enabled = !botMatch && ["ranked", "casual", "custom", "customroom", "challenge", "friendchallenge"].includes(mode);
+  const preferred = enabled;
+  const matchSeed = sha256(`${state.id}:${state.createdAt || Date.now()}`).slice(0, 24);
+  const hostSide = stableHostSide(state);
+  return {
+    version: 1,
+    enabled,
+    preferred,
+    mode: enabled ? "arenamesh" : "server-authoritative",
+    transport: "webrtc-datachannel",
+    signaling: true,
+    signalingRoom: `mesh:${state.id}`,
+    serverFallback: true,
+    fallbackActive: false,
+    receiptRequired: Boolean(state.ranked),
+    quickGameReady: !state.ranked,
+    matchSeed,
+    hostSide,
+    hostPlayerId: state.players[hostSide].id,
+    ...iceCapabilities(state.id),
+    peers: ["south", "north"].map((side) => ({
+      side,
+      id: state.players[side].id,
+      handle: state.players[side].handle,
+      avatarUrl: state.players[side].avatarUrl || null,
+      ballSkin: normalizeBallSkin(state.players[side].ballSkin)
+    }))
+  };
+}
+
+function iceCapabilities(matchId = "") {
+  const iceServers = buildIceServers(matchId);
+  const turnEnabled = iceServers.some((server) => server.urls.some((url) => /^turns?:/i.test(url)));
+  return {
+    iceServers,
+    turnEnabled,
+    relayMode: turnEnabled ? "stun-turn" : "stun"
+  };
+}
+
+function buildIceServers(matchId = "") {
+  const stunUrls = splitEnvList(process.env.ICE_STUN_URLS).map(normalizeIceUrl).filter(Boolean);
+  const servers = (stunUrls.length ? stunUrls : DEFAULT_STUN_URLS)
+    .map((url) => ({ urls: [url] }));
+  const turnUrls = splitEnvList(process.env.TURN_URLS).map(normalizeIceUrl).filter(Boolean);
+  if (!turnUrls.length) return servers;
+
+  const turnCredentials = buildTurnCredentials(matchId);
+  if (turnCredentials || process.env.TURN_ALLOW_ANONYMOUS === "true") {
+    servers.push({
+      urls: turnUrls,
+      ...(turnCredentials || {})
+    });
+  } else if (process.env.NODE_ENV !== "test") {
+    console.warn("TURN_URLS configured without TURN credentials; TURN relay candidates were not advertised");
+  }
+  return servers;
+}
+
+function buildTurnCredentials(matchId = "") {
+  const secret = String(process.env.TURN_STATIC_AUTH_SECRET || "").trim();
+  if (secret) {
+    const ttl = Math.max(300, Number(process.env.TURN_TTL_SECONDS || 3600));
+    const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+    const matchToken = cleanId(matchId, 48) || "match";
+    const username = `${expiresAt}:blockshift-${matchToken}`;
+    const credential = crypto.createHmac("sha1", secret).update(username).digest("base64");
+    return { username, credential, credentialType: "password", ttlSeconds: ttl };
+  }
+  const username = String(process.env.TURN_USERNAME || "").trim();
+  const credential = String(process.env.TURN_CREDENTIAL || "").trim();
+  return username && credential ? { username, credential, credentialType: "password" } : null;
+}
+
+function splitEnvList(value) {
+  return String(value || "")
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isAllowedIceUrl(url) {
+  return /^(stun|turn|turns):/i.test(String(url || "").trim());
+}
+
+function normalizeIceUrl(url) {
+  const text = String(url || "").trim();
+  if (!isAllowedIceUrl(text)) return "";
+  if (/\s/.test(text)) return "";
+  if (/(ICE_STUN_URLS|TURN_URLS|TURN_USERNAME|TURN_CREDENTIAL|TURN_STATIC_AUTH_SECRET|TURN_TTL_SECONDS)=/i.test(text)) return "";
+  return text;
+}
+
+function redactedMeshConfig(mesh) {
+  if (!mesh) return mesh;
+  return {
+    ...mesh,
+    iceServers: Array.isArray(mesh.iceServers)
+      ? mesh.iceServers.map((server) => ({
+          urls: server.urls,
+          username: server.username ? "[configured]" : undefined,
+          credential: server.credential ? "[redacted]" : undefined
+        }))
+      : []
+  };
+}
+
+function stableHostSide(state) {
+  const south = state.players.south.id || state.players.south.handle || "south";
+  const north = state.players.north.id || state.players.north.handle || "north";
+  return south.localeCompare(north) <= 0 ? "south" : "north";
+}
+
+function verifyMeshEnvelope(state, side, action, clientSeq, meshEnvelope = {}) {
+  const matchId = state.id;
+  const envelope = safeObject(meshEnvelope);
+  const envelopeProvided = Object.keys(envelope).length > 0;
+  const chain = meshChainsByMatch.get(matchId) || { south: "genesis", north: "genesis" };
+  const previousHash = cleanHash(envelope.previousHash) || chain[side] || "genesis";
+  const expectedActionHash = meshActionHash(matchId, side, clientSeq, action, previousHash);
+  const providedActionHash = cleanHash(envelope.actionHash);
+  const actionHash = providedActionHash || expectedActionHash;
+  const expectedChainHash = sha256(`${previousHash}|${actionHash}|${matchId}|${side}|${state.replay.length + 1}`);
+  const providedChainHash = cleanHash(envelope.chainHash);
+  const required = Boolean(state.ranked) && !hasBotPlayer(state);
+  const verified = envelopeProvided
+    ? providedActionHash === expectedActionHash && (!providedChainHash || providedChainHash === expectedChainHash)
+    : !required;
+  return {
+    matchId,
+    side,
+    playerId: state.players[side].id,
+    clientSeq: Number(clientSeq) || 0,
+    serverSeq: state.replay.length + 1,
+    previousHash,
+    actionHash,
+    expectedActionHash,
+    chainHash: providedChainHash || expectedChainHash,
+    stateHash: cleanHash(envelope.stateHash),
+    nodeId: cleanId(envelope.nodeId, 96),
+    required,
+    verified,
+    receivedAt: Date.now()
+  };
+}
+
+function stateWithMeshReceipt(state, receipt) {
+  const next = structuredClone(state);
+  const existing = next.arenaHive && typeof next.arenaHive === "object" ? next.arenaHive : {};
+  const chains = {
+    south: existing.chains?.south || "genesis",
+    north: existing.chains?.north || "genesis"
+  };
+  chains[receipt.side] = receipt.chainHash;
+  next.arenaHive = {
+    version: 1,
+    mode: activeMeshConfig(state.id)?.mode || "server-authoritative",
+    receipts: [...(Array.isArray(existing.receipts) ? existing.receipts : []), receipt].slice(-MESH_RECEIPT_WINDOW),
+    chains,
+    lastVerifiedSeq: receipt.verified ? receipt.serverSeq : Number(existing.lastVerifiedSeq || 0),
+    updatedAt: Date.now()
+  };
+  return next;
+}
+
+function commitMeshReceipt(matchId, receipt, persistedState) {
+  if (!receipt) return;
+  receipt.serverSeq = persistedState.replay.length;
+  receipt.status = persistedState.status;
+  rememberMeshReceipt(matchId, receipt);
+  const chain = meshChainsByMatch.get(matchId) || { south: "genesis", north: "genesis" };
+  chain[receipt.side] = receipt.chainHash;
+  meshChainsByMatch.set(matchId, chain);
+}
+
+function sanitizeMeshReceipt(matchId, side, receipt = {}) {
+  const clean = safeObject(receipt);
+  return {
+    matchId,
+    side,
+    playerId: cleanId(clean.playerId, 128),
+    clientSeq: Number(clean.clientSeq) || 0,
+    serverSeq: Number(clean.serverSeq) || 0,
+    previousHash: cleanHash(clean.previousHash),
+    actionHash: cleanHash(clean.actionHash),
+    chainHash: cleanHash(clean.chainHash),
+    stateHash: cleanHash(clean.stateHash),
+    verified: Boolean(clean.verified),
+    receivedAt: Number(clean.receivedAt) || Date.now()
+  };
+}
+
+function rememberMeshReceipt(matchId, receipt) {
+  if (!meshReceiptsByMatch.has(matchId)) meshReceiptsByMatch.set(matchId, []);
+  const receipts = meshReceiptsByMatch.get(matchId);
+  receipts.push(receipt);
+  if (receipts.length > MESH_RECEIPT_WINDOW) receipts.splice(0, receipts.length - MESH_RECEIPT_WINDOW);
+}
+
+function meshActionHash(matchId, side, clientSeq, action = {}, previousHash = "genesis") {
+  const orientation = action.orientation || "";
+  return sha256(`${matchId}|${side}|${Number(clientSeq) || 0}|${action.type || ""}|${Number(action.row) || 0}|${Number(action.col) || 0}|${orientation}|${previousHash}`);
+}
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function cleanHash(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (text === "genesis") return "genesis";
+  return /^[a-f0-9]{64}$/.test(text) ? text : "";
+}
+
+function cleanId(value, maxLength = 96) {
+  return String(value || "").trim().replace(/[^\w:.-]/g, "").slice(0, maxLength);
+}
+
+function cleanReason(value) {
+  return String(value || "mesh_fallback").trim().replace(/[^\w .:-]/g, "").slice(0, 120) || "mesh_fallback";
+}
+
+function cleanSignalType(value) {
+  const type = String(value || "data").trim().toLowerCase();
+  return ["offer", "answer", "ice", "hello", "data", "renegotiate"].includes(type) ? type : "data";
+}
+
+function safeObject(value, maxLength = 8192) {
+  if (!value || typeof value !== "object") return {};
+  try {
+    return JSON.parse(JSON.stringify(value).slice(0, maxLength));
+  } catch {
+    return {};
+  }
 }
 
 function sideForPlayer(state, playerId) {
@@ -640,15 +1175,14 @@ function clearMatchClock(matchId) {
 }
 
 async function settleClockTimeout(io, matchId, now = Date.now()) {
-  const state = matches.get(matchId);
+  const state = await loadActiveMatch(matchId);
   if (!state || state.status !== "active") return state || null;
   const next = finishByClockTimeout(state, state.turn, now);
   if (next.status === "active") {
     scheduleMatchClock(io, matchId);
     return state;
   }
-  const persistedState = await persistMatch(next);
-  matches.set(matchId, persistedState);
+  const persistedState = await storeMatchState(next);
   clearMatchClock(matchId);
   const publicState = stateWithSpectators(matchId, persistedState);
   io.to(`match:${matchId}`).emit(next.status === "abandoned" ? "match:abandoned" : "match:clockExpired", {
@@ -658,7 +1192,7 @@ async function settleClockTimeout(io, matchId, now = Date.now()) {
     state: publicState,
     at: now
   });
-  io.to(`match:${matchId}`).emit("match:state", { matchId, state: publicState, timeout: true });
+  emitMatchState(io, matchId, { matchId, state: publicState, mesh: activeMeshConfig(matchId), timeout: true }, persistedState, { forceSpectators: true });
   broadcastFriendPresence(io, persistedState.players.south.id);
   broadcastFriendPresence(io, persistedState.players.north.id);
   return persistedState;
@@ -682,8 +1216,8 @@ function hasBotPlayer(state) {
   return state.players.south.id.startsWith("bot_") || state.players.north.id.startsWith("bot_");
 }
 
-function acceptRematch(io, matchId, offer, acceptingUser = null) {
-  const state = matches.get(matchId);
+async function acceptRematch(io, matchId, offer, acceptingUser = null) {
+  const state = await loadActiveMatch(matchId);
   if (!state) throw new Error("match_not_found");
   rematchOffers.delete(matchId);
   removeRematchInboxOffer(offer);
@@ -705,7 +1239,7 @@ function acceptRematch(io, matchId, offer, acceptingUser = null) {
     };
   }
   const nextState = startMatch(io, ticket, [playersBySide.north, playersBySide.south]);
-  const payload = { matchId, newMatchId: nextState.id, state: nextState, acceptedBy: offer.toSide, at: Date.now() };
+  const payload = { matchId, newMatchId: nextState.id, state: nextState, mesh: activeMeshConfig(nextState.id), acceptedBy: offer.toSide, at: Date.now() };
   io.to(`match:${matchId}`).emit("match:rematchAccepted", payload);
   return nextState;
 }
@@ -1196,14 +1730,18 @@ function broadcastRoomList(io) {
 function startMatch(io, ticket, players) {
   const state = createInitialState({ mode: ticket.mode, ranked: ticket.ranked, players });
   matches.set(state.id, state);
+  const mesh = installMeshForMatch(state, ticket);
+  void saveActiveMatch(state, { immediate: true });
   scheduleMatchClock(io, state.id);
   const publicState = stateWithSpectators(state.id, state);
   for (const side of ["south", "north"]) {
     const player = state.players[side];
     const socketId = socketsByPlayer.get(player.id);
     if (socketId) {
-      io.sockets.sockets.get(socketId)?.join(`match:${state.id}`);
-      io.to(socketId).emit("match:found", { matchId: state.id, side, state: publicState, legalMoves: legalMoves(state, side) });
+      const socket = io.sockets.sockets.get(socketId);
+      socket?.join(`match:${state.id}`);
+      socket?.join(playerRoom(state.id));
+      io.to(socketId).emit("match:found", { matchId: state.id, side, state: publicState, mesh, legalMoves: legalMoves(state, side) });
     }
   }
   players.forEach((player) => broadcastFriendPresence(io, player.id));
@@ -1226,6 +1764,27 @@ function stateWithSpectators(matchId, state) {
   return { ...state, spectatorCount: spectatorCount(matchId) };
 }
 
+function playerRoom(matchId) {
+  return `match:${String(matchId || "").trim()}:players`;
+}
+
+function spectatorRoom(matchId) {
+  return `match:${String(matchId || "").trim()}:spectators`;
+}
+
+function emitMatchState(io, matchId, payload, state, options = {}) {
+  const normalized = String(matchId || "").trim();
+  if (!normalized) return;
+  io.to(playerRoom(normalized)).emit("match:state", payload);
+  if (spectatorCount(normalized) <= 0) return;
+  const forceSpectators = Boolean(options.forceSpectators) || state?.status !== "active";
+  const now = Date.now();
+  const lastSentAt = spectatorStateLastSentAt.get(normalized) || 0;
+  if (!forceSpectators && now - lastSentAt < SPECTATOR_STATE_INTERVAL_MS) return;
+  spectatorStateLastSentAt.set(normalized, now);
+  io.to(spectatorRoom(normalized)).emit("match:state", payload);
+}
+
 function emitSpectatorCount(io, matchId) {
   const normalized = String(matchId || "").trim();
   if (!normalized) return;
@@ -1244,6 +1803,7 @@ function removeSpectator(io, socket, matchId) {
   if (set.size === 0) spectatorsByMatch.delete(normalized);
   if (!removed) return false;
   socket.leave(`match:${normalized}`);
+  socket.leave(spectatorRoom(normalized));
   if (socket.data?.spectatingMatchId === normalized) socket.data.spectatingMatchId = "";
   emitSpectatorCount(io, normalized);
   return true;

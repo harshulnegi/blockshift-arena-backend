@@ -28,6 +28,14 @@ export function createInitialState({ ranked = false, mode = "casual", players })
     },
     walls: [],
     replay: [],
+    arenaHive: {
+      version: 1,
+      receipts: [],
+      chains: {
+        south: "genesis",
+        north: "genesis"
+      }
+    },
     clocks: {
       southMs: START_CLOCK_MS,
       northMs: START_CLOCK_MS,

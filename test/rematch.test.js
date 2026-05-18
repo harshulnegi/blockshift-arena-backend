@@ -196,6 +196,137 @@ test("ranked matchmaking waits until another ranked player joins", async () => {
   }
 });
 
+test("match mesh advertises configured TURN relay candidates", async () => {
+  const previous = {
+    TURN_URLS: process.env.TURN_URLS,
+    TURN_USERNAME: process.env.TURN_USERNAME,
+    TURN_CREDENTIAL: process.env.TURN_CREDENTIAL,
+    TURN_STATIC_AUTH_SECRET: process.env.TURN_STATIC_AUTH_SECRET
+  };
+  process.env.TURN_URLS = "turn:turn.blockshift.test:3478?transport=udp,turns:turn.blockshift.test:5349?transport=tcp";
+  process.env.TURN_USERNAME = "turn_user";
+  process.env.TURN_CREDENTIAL = "turn_secret";
+  delete process.env.TURN_STATIC_AUTH_SECRET;
+
+  const server = http.createServer();
+  const io = attachSocketServer(server, null);
+  await listen(server);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const sockets = [];
+
+  try {
+    const host = await connectUser(baseUrl, "turn_host", "TurnHost");
+    const guest = await connectUser(baseUrl, "turn_guest", "TurnGuest");
+    sockets.push(host, guest);
+
+    const room = await emitAck(host, "room:create", { ballSkin: "core" });
+    assert.equal(room.ok, true);
+    const joined = await emitAck(guest, "room:join", { code: room.code, ballSkin: "nova" });
+    assert.equal(joined.ok, true);
+    assert.equal(joined.mesh.turnEnabled, true);
+    assert.equal(joined.mesh.relayMode, "stun-turn");
+    const turnServer = joined.mesh.iceServers.find((server) => server.urls.some((url) => url.startsWith("turn:")));
+    assert.ok(turnServer);
+    assert.equal(turnServer.username, "turn_user");
+    assert.equal(turnServer.credential, "turn_secret");
+  } finally {
+    for (const socket of sockets) socket.close();
+    io.close();
+    await close(server);
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("malformed ICE env values do not leak assignment text into candidates", async () => {
+  const previous = {
+    ICE_STUN_URLS: process.env.ICE_STUN_URLS,
+    TURN_URLS: process.env.TURN_URLS,
+    TURN_USERNAME: process.env.TURN_USERNAME,
+    TURN_CREDENTIAL: process.env.TURN_CREDENTIAL,
+    TURN_STATIC_AUTH_SECRET: process.env.TURN_STATIC_AUTH_SECRET
+  };
+  process.env.ICE_STUN_URLS = "stun:stun.l.google.com:19302TURN_URLS=turn:bad.example:3478";
+  process.env.TURN_URLS = "turn:turn.blockshift.test:3478?transport=udp";
+  process.env.TURN_USERNAME = "turn_user";
+  process.env.TURN_CREDENTIAL = "turn_secret";
+  delete process.env.TURN_STATIC_AUTH_SECRET;
+
+  const server = http.createServer();
+  const io = attachSocketServer(server, null);
+  await listen(server);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const sockets = [];
+
+  try {
+    const host = await connectUser(baseUrl, "turn_clean_host", "TurnCleanHost");
+    const guest = await connectUser(baseUrl, "turn_clean_guest", "TurnCleanGuest");
+    sockets.push(host, guest);
+
+    const room = await emitAck(host, "room:create", { ballSkin: "core" });
+    const joined = await emitAck(guest, "room:join", { code: room.code, ballSkin: "nova" });
+    const urls = joined.mesh.iceServers.flatMap((server) => server.urls || []);
+    assert.ok(urls.includes("turn:turn.blockshift.test:3478?transport=udp"));
+    assert.equal(urls.some((url) => url.includes("TURN_URLS=")), false);
+  } finally {
+    for (const socket of sockets) socket.close();
+    io.close();
+    await close(server);
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("active match Redis snapshots are coalesced while final state writes immediately", async () => {
+  const redis = {
+    setCalls: [],
+    async set(...args) {
+      this.setCalls.push(args);
+      return "OK";
+    },
+    async get() {
+      return null;
+    }
+  };
+  const server = http.createServer();
+  const io = attachSocketServer(server, redis);
+  await listen(server);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const sockets = [];
+
+  try {
+    const host = await connectUser(baseUrl, "cache_host", "CacheHost");
+    const guest = await connectUser(baseUrl, "cache_guest", "CacheGuest");
+    sockets.push(host, guest);
+
+    const room = await emitAck(host, "room:create", { ballSkin: "core" });
+    const joined = await emitAck(guest, "room:join", { code: room.code, ballSkin: "nova" });
+    assert.equal(joined.ok, true);
+    assert.equal(redis.setCalls.length, 1);
+
+    const move = await emitAck(host, "match:action", {
+      matchId: joined.matchId,
+      clientSeq: 1,
+      action: { type: "move", row: 7, col: 4 }
+    });
+    assert.equal(move.ok, true);
+    assert.equal(redis.setCalls.length, 1);
+
+    const left = await emitAck(host, "match:leave", { matchId: joined.matchId });
+    assert.equal(left.ok, true);
+    assert.equal(left.state.status, "finished");
+    assert.ok(redis.setCalls.length >= 2);
+  } finally {
+    for (const socket of sockets) socket.close();
+    io.close();
+    await close(server);
+  }
+});
+
 test("spectator joins are watch only and cannot submit actions", async () => {
   const server = http.createServer();
   const io = attachSocketServer(server, null);
