@@ -201,11 +201,13 @@ test("match mesh advertises configured TURN relay candidates", async () => {
     TURN_URLS: process.env.TURN_URLS,
     TURN_USERNAME: process.env.TURN_USERNAME,
     TURN_CREDENTIAL: process.env.TURN_CREDENTIAL,
-    TURN_STATIC_AUTH_SECRET: process.env.TURN_STATIC_AUTH_SECRET
+    TURN_STATIC_AUTH_SECRET: process.env.TURN_STATIC_AUTH_SECRET,
+    P2P_RELAY_ONLY: process.env.P2P_RELAY_ONLY
   };
   process.env.TURN_URLS = "turn:turn.blockshift.test:3478?transport=udp,turns:turn.blockshift.test:5349?transport=tcp";
   process.env.TURN_USERNAME = "turn_user";
   process.env.TURN_CREDENTIAL = "turn_secret";
+  process.env.P2P_RELAY_ONLY = "true";
   delete process.env.TURN_STATIC_AUTH_SECRET;
 
   const server = http.createServer();
@@ -224,7 +226,9 @@ test("match mesh advertises configured TURN relay candidates", async () => {
     const joined = await emitAck(guest, "room:join", { code: room.code, ballSkin: "nova" });
     assert.equal(joined.ok, true);
     assert.equal(joined.mesh.turnEnabled, true);
-    assert.equal(joined.mesh.relayMode, "stun-turn");
+    assert.equal(joined.mesh.relayOnly, true);
+    assert.equal(joined.mesh.iceTransportPolicy, "relay");
+    assert.equal(joined.mesh.relayMode, "turn-only");
     const turnServer = joined.mesh.iceServers.find((server) => server.urls.some((url) => url.startsWith("turn:")));
     assert.ok(turnServer);
     assert.equal(turnServer.username, "turn_user");

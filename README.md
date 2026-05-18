@@ -30,3 +30,6 @@ AVATAR_STORAGE=database
 
 The server runs SQL migrations on startup, stores ranked stats in Neon, uses Upstash Redis for matchmaking and Socket.IO scaling, and keeps profile photos as small database-backed JPEG data URLs for Render's ephemeral filesystem.
 
+## TURN Relay Verification
+
+To prove cellular TURN fallback, temporarily set `P2P_RELAY_ONLY=true` on the backend. New matches will advertise `relayOnly=true`, `iceTransportPolicy=relay`, and `relayMode=turn-only`; Android will force WebRTC to use TURN relay candidates only. Turn it back to `false` after testing so direct/STUN P2P stays faster and cheaper.

@@ -891,6 +891,7 @@ function createMeshConfig(state, ticket = {}) {
   const preferred = enabled;
   const matchSeed = sha256(`${state.id}:${state.createdAt || Date.now()}`).slice(0, 24);
   const hostSide = stableHostSide(state);
+  const ice = iceCapabilities(state.id);
   return {
     version: 1,
     enabled,
@@ -906,7 +907,7 @@ function createMeshConfig(state, ticket = {}) {
     matchSeed,
     hostSide,
     hostPlayerId: state.players[hostSide].id,
-    ...iceCapabilities(state.id),
+    ...ice,
     peers: ["south", "north"].map((side) => ({
       side,
       id: state.players[side].id,
@@ -920,11 +921,20 @@ function createMeshConfig(state, ticket = {}) {
 function iceCapabilities(matchId = "") {
   const iceServers = buildIceServers(matchId);
   const turnEnabled = iceServers.some((server) => server.urls.some((url) => /^turns?:/i.test(url)));
+  const relayOnly = envFlag("P2P_RELAY_ONLY", false) && turnEnabled;
   return {
     iceServers,
     turnEnabled,
-    relayMode: turnEnabled ? "stun-turn" : "stun"
+    relayOnly,
+    iceTransportPolicy: relayOnly ? "relay" : "all",
+    relayMode: relayOnly ? "turn-only" : turnEnabled ? "stun-turn" : "stun"
   };
+}
+
+function envFlag(name, defaultValue = false) {
+  const value = process.env[name];
+  if (value == null || value === "") return defaultValue;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
 function buildIceServers(matchId = "") {
