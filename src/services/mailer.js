@@ -3,6 +3,21 @@ import nodemailer from "nodemailer";
 let transporterPromise = null;
 
 export async function sendOtpEmail({ to, code, expiresInSeconds, purpose = "login" }) {
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER || "BlockShift Arena <no-reply@blockshiftarena.local>";
+  const minutes = Math.max(1, Math.ceil(expiresInSeconds / 60));
+  const message = {
+    from,
+    to,
+    subject: otpSubject(purpose),
+    text: `Your BlockShift Arena ${otpPurposeLabel(purpose)} code is ${code}. It expires in ${minutes} minutes. If you did not request this, ignore this email.`,
+    html: otpEmailHtml(code, minutes, purpose)
+  };
+
+  if (process.env.BREVO_API_KEY) {
+    await sendBrevoApiEmail(message);
+    return { mode: "brevo-api" };
+  }
+
   const transporter = await smtpTransporter();
   if (!transporter) {
     if (process.env.NODE_ENV === "production" && process.env.EXPOSE_DEV_OTP === "false") {
@@ -14,16 +29,53 @@ export async function sendOtpEmail({ to, code, expiresInSeconds, purpose = "logi
     return { mode: "dev-log" };
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER || "BlockShift Arena <no-reply@blockshiftarena.local>";
-  const minutes = Math.max(1, Math.ceil(expiresInSeconds / 60));
   await transporter.sendMail({
-    from,
-    to,
-    subject: otpSubject(purpose),
-    text: `Your BlockShift Arena ${otpPurposeLabel(purpose)} code is ${code}. It expires in ${minutes} minutes. If you did not request this, ignore this email.`,
-    html: otpEmailHtml(code, minutes, purpose)
+    from: message.from,
+    to: message.to,
+    subject: message.subject,
+    text: message.text,
+    html: message.html
   });
   return { mode: "smtp" };
+}
+
+async function sendBrevoApiEmail(message) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.BREVO_API_TIMEOUT_MS || 15000));
+  try {
+    const sender = parseSender(message.from);
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email: message.to }],
+        subject: message.subject,
+        textContent: message.text,
+        htmlContent: message.html
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const error = new Error(`brevo_api_${response.status}`);
+      error.statusCode = response.status >= 500 ? 502 : 400;
+      throw error;
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error("brevo_api_timeout");
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function smtpTransporter() {
@@ -57,6 +109,27 @@ function otpPurposeLabel(purpose) {
   if (purpose === "signup") return "signup";
   if (purpose === "password_reset") return "password reset";
   return "login";
+}
+
+function parseSender(value) {
+  const from = String(value || "").trim();
+  const bracketMatch = from.match(/^(?:"?([^"<]*)"?\s*)?<([^<>@\s]+@[^<>\s]+)>$/);
+  if (bracketMatch) {
+    return {
+      name: bracketMatch[1].trim() || "BlockShift Arena",
+      email: bracketMatch[2].trim()
+    };
+  }
+  if (from.includes("@")) {
+    return {
+      name: "BlockShift Arena",
+      email: from.replace(/^"|"$/g, "")
+    };
+  }
+  return {
+    name: "BlockShift Arena",
+    email: "no-reply@blockshiftarena.local"
+  };
 }
 
 function otpEmailHtml(code, minutes, purpose) {
