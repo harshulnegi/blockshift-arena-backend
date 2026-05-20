@@ -13,6 +13,7 @@ import { createApiRouter } from "./routes/api.js";
 const app = express();
 const storageDir = process.env.BLOCKSHIFT_STORAGE_DIR || path.join(process.cwd(), "storage");
 const avatarDir = process.env.AVATAR_DIR || path.join(storageDir, "avatars");
+const emailAssetDir = path.join(process.cwd(), "public", "email-assets");
 const useSocketRedisAdapter = envFlag("SOCKET_REDIS_ADAPTER_ENABLED", false);
 const useRedisMatchmaker = envFlag("MATCHMAKER_REDIS_ENABLED", false);
 app.set("trust proxy", 1);
@@ -25,6 +26,13 @@ app.use("/avatars", express.static(avatarDir, {
   setHeaders: (res) => {
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     res.setHeader("Cache-Control", "public, max-age=3600");
+  }
+}));
+app.use("/email-assets", express.static(emailAssetDir, {
+  maxAge: "24h",
+  setHeaders: (res) => {
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Cache-Control", "public, max-age=86400");
   }
 }));
 app.get("/health", (_req, res) => res.json({ ok: true, service: "blockshift-arena", at: new Date().toISOString() }));

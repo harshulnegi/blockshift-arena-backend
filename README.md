@@ -22,6 +22,7 @@ DATABASE_URL=<Neon pooled Postgres URL with sslmode=require>
 DATABASE_SSL=true
 REDIS_URL=<Upstash rediss:// URL>
 JWT_SECRET=<long random secret>
+PUBLIC_BASE_URL=<public https backend url, for avatars + OTP email assets>
 GOOGLE_WEB_CLIENT_ID=<optional Google web client id>
 ALLOW_DEV_GOOGLE_AUTH=false
 EXPOSE_DEV_OTP=false
@@ -29,6 +30,8 @@ AVATAR_STORAGE=database
 ```
 
 The server runs SQL migrations on startup, stores ranked stats in Neon, uses Upstash Redis for matchmaking and Socket.IO scaling, and keeps profile photos as small database-backed JPEG data URLs for Render's ephemeral filesystem.
+
+OTP emails use hosted branding assets from `/email-assets`, so `PUBLIC_BASE_URL` should always point to the public backend origin in production.
 
 ## TURN Relay Verification
 
