@@ -11,10 +11,14 @@ import {
   loginGuestAccount,
   loginGoogleAccount,
   loginPasswordAccount,
+  requestPasswordResetOtp,
+  requestRegistrationOtp,
   registerPasswordAccount,
   requestEmailOtp,
+  resetPasswordWithOtp,
   sessionProfile,
   syncAccountHandle,
+  verifyRegistrationOtp,
   verifyEmailOtp
 } from "../services/authStore.js";
 import { findProfile, leaderboard, MAX_AVATAR_BYTES, searchProfiles, updateProfileAvatar, upsertProfile } from "../services/matchStore.js";
@@ -26,6 +30,24 @@ export function createApiRouter() {
     try {
       const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
       const { profile } = await registerPasswordAccount({ ...req.body, country });
+      sendAuth(res, profile);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  router.post("/auth/register/request", async (req, res) => {
+    try {
+      res.json(await requestRegistrationOtp(req.body));
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  router.post("/auth/register/verify", async (req, res) => {
+    try {
+      const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
+      const { profile } = await verifyRegistrationOtp({ ...req.body, country });
       sendAuth(res, profile);
     } catch (error) {
       sendAuthError(res, error);
@@ -73,6 +95,24 @@ export function createApiRouter() {
     try {
       const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
       const { profile } = await verifyEmailOtp({ ...req.body, country });
+      sendAuth(res, profile);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  router.post("/auth/password/reset/request", async (req, res) => {
+    try {
+      res.json(await requestPasswordResetOtp(req.body));
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  router.post("/auth/password/reset/verify", async (req, res) => {
+    try {
+      const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
+      const { profile } = await resetPasswordWithOtp({ ...req.body, country });
       sendAuth(res, profile);
     } catch (error) {
       sendAuthError(res, error);

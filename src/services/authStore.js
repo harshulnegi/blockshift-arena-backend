@@ -8,11 +8,15 @@ import { getAuth } from "firebase-admin/auth";
 import { OAuth2Client } from "google-auth-library";
 import { query } from "../db/pool.js";
 import { deletePlayerData, findProfile, upsertProfile } from "./matchStore.js";
+import { sendOtpEmail } from "./mailer.js";
 
 const isTestRun = process.env.NODE_ENV === "test" || process.env.npm_lifecycle_event === "test";
 const STORAGE_DIR = process.env.BLOCKSHIFT_STORAGE_DIR || (isTestRun ? path.join(os.tmpdir(), "blockshift-arena-tests", String(process.pid)) : path.join(process.cwd(), "storage"));
 const ACCOUNT_STORE = path.join(STORAGE_DIR, "accounts.json");
 const OTP_TTL_MS = 5 * 60 * 1000;
+const OTP_PURPOSE_LOGIN = "login";
+const OTP_PURPOSE_SIGNUP = "signup";
+const OTP_PURPOSE_PASSWORD_RESET = "password_reset";
 const HANDLE_MAX = 18;
 const BIO_MAX_WORDS = 24;
 const memoryAccounts = new Map();
@@ -129,24 +133,12 @@ export async function loginGuestAccount({ deviceId, country = "GLOBAL" }) {
 }
 
 export async function requestEmailOtp({ email }) {
-  const normalizedEmail = assertEmail(email);
-  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
-  const otpHash = await bcrypt.hash(code, 10);
-  const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
-  await saveOtp(normalizedEmail, otpHash, expiresAt);
-  return {
-    sent: true,
-    expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
-    devOtp: shouldExposeDevOtp() ? code : undefined
-  };
+  return issueEmailOtp({ email, purpose: OTP_PURPOSE_LOGIN });
 }
 
 export async function verifyEmailOtp({ email, code, handle, country = "GLOBAL" }) {
   const normalizedEmail = assertEmail(email);
-  const record = await findOtp(normalizedEmail);
-  if (!record || Date.parse(record.expiresAt) < Date.now()) throw authError(401, "otp_expired");
-  if (!(await bcrypt.compare(String(code || "").trim(), record.otpHash))) throw authError(401, "otp_invalid");
-  await clearOtp(normalizedEmail);
+  await verifyStoredOtp(normalizedEmail, code, OTP_PURPOSE_LOGIN);
 
   const existing = await findAccountByEmail(normalizedEmail);
   if (existing) {
@@ -170,6 +162,71 @@ export async function verifyEmailOtp({ email, code, handle, country = "GLOBAL" }
   return { account, profile };
 }
 
+export async function requestRegistrationOtp({ name, username, handle, email, password }) {
+  const normalizedEmail = assertEmail(email);
+  const cleanHandle = assertHandle(username || handle);
+  cleanDisplayName(name || cleanHandle);
+  assertPassword(password);
+  await assertUniqueEmail(normalizedEmail);
+  await assertUniqueHandle(cleanHandle);
+  return issueEmailOtp({ email: normalizedEmail, purpose: OTP_PURPOSE_SIGNUP });
+}
+
+export async function verifyRegistrationOtp({ name, username, handle, email, password, code, country = "GLOBAL" }) {
+  const normalizedEmail = assertEmail(email);
+  await verifyStoredOtp(normalizedEmail, code, OTP_PURPOSE_SIGNUP);
+  return registerPasswordAccount({ name, username, handle, email: normalizedEmail, password, country });
+}
+
+export async function requestPasswordResetOtp({ email }) {
+  const normalizedEmail = assertEmail(email);
+  const account = await findAccountByEmail(normalizedEmail);
+  if (!account) throw authError(404, "account_not_found");
+  return issueEmailOtp({ email: normalizedEmail, purpose: OTP_PURPOSE_PASSWORD_RESET });
+}
+
+export async function resetPasswordWithOtp({ email, code, password, country = "GLOBAL" }) {
+  const normalizedEmail = assertEmail(email);
+  await verifyStoredOtp(normalizedEmail, code, OTP_PURPOSE_PASSWORD_RESET);
+  assertPassword(password);
+  const account = await findAccountByEmail(normalizedEmail);
+  if (!account) throw authError(404, "account_not_found");
+  const passwordHash = await bcrypt.hash(password, 12);
+  const updated = await updateAccount(account.id, {
+    passwordHash,
+    providers: uniqueProviders([...account.providers, "password"])
+  });
+  const profile = (await findProfile(updated.id)) || (await upsertProfile({ id: updated.id, handle: updated.handle, name: updated.name, country }));
+  return { account: updated, profile };
+}
+
+async function issueEmailOtp({ email, purpose }) {
+  const normalizedEmail = assertEmail(email);
+  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  const otpHash = await bcrypt.hash(code, 10);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
+  await saveOtp(normalizedEmail, purpose, otpHash, expiresAt);
+  const expiresInSeconds = Math.floor(OTP_TTL_MS / 1000);
+  const delivery = await sendOtpEmail({ to: normalizedEmail, code, expiresInSeconds, purpose });
+  return {
+    sent: true,
+    delivery: delivery.mode,
+    purpose,
+    expiresInSeconds,
+    devOtp: shouldExposeDevOtp() ? code : undefined
+  };
+}
+
+async function verifyStoredOtp(email, code, purpose) {
+  const record = await findOtp(email, purpose);
+  if (!record || Date.parse(record.expiresAt) < Date.now()) {
+    if (record) await clearOtp(email);
+    throw authError(401, "otp_expired");
+  }
+  if (!(await bcrypt.compare(String(code || "").trim(), record.otpHash))) throw authError(401, "otp_invalid");
+  await clearOtp(email);
+}
+
 export async function sessionProfile(user) {
   if (!user?.id) throw authError(401, "unauthorized");
   const account = await findAccountById(user.id);
@@ -187,7 +244,7 @@ export async function deleteAccount({ user, confirmation }) {
   if (!process.env.DATABASE_URL) {
     await loadMemoryAccountsOnce();
     memoryAccounts.delete(user.id);
-    memoryOtps.delete(account.email);
+    clearMemoryOtpsForEmail(account.email);
     await saveMemoryAccounts();
     return { ok: true };
   }
@@ -393,33 +450,43 @@ async function updateAccount(id, patch) {
   return toAccount(rows[0]);
 }
 
-async function saveOtp(email, otpHash, expiresAt) {
+async function saveOtp(email, purpose, otpHash, expiresAt) {
   if (!process.env.DATABASE_URL) {
-    memoryOtps.set(email, { otpHash, expiresAt });
+    memoryOtps.set(otpKey(email, purpose), { otpHash, expiresAt, purpose });
     return;
   }
   await ensureAuthTables();
   await query(
-    `insert into auth_otps(email, otp_hash, expires_at) values($1, $2, $3)
-     on conflict(email) do update set otp_hash = excluded.otp_hash, expires_at = excluded.expires_at, updated_at = now()`,
-    [email, otpHash, expiresAt]
+    `insert into auth_otps(email, purpose, otp_hash, expires_at) values($1, $2, $3, $4)
+     on conflict(email) do update set purpose = excluded.purpose, otp_hash = excluded.otp_hash, expires_at = excluded.expires_at, updated_at = now()`,
+    [email, purpose, otpHash, expiresAt]
   );
 }
 
-async function findOtp(email) {
-  if (!process.env.DATABASE_URL) return memoryOtps.get(email) || null;
+async function findOtp(email, purpose) {
+  if (!process.env.DATABASE_URL) return memoryOtps.get(otpKey(email, purpose)) || null;
   await ensureAuthTables();
-  const { rows } = await query("select otp_hash, expires_at from auth_otps where email = $1 limit 1", [email]);
-  return rows[0] ? { otpHash: rows[0].otp_hash, expiresAt: rows[0].expires_at instanceof Date ? rows[0].expires_at.toISOString() : rows[0].expires_at } : null;
+  const { rows } = await query("select otp_hash, expires_at, purpose from auth_otps where email = $1 and purpose = $2 limit 1", [email, purpose]);
+  return rows[0] ? { otpHash: rows[0].otp_hash, expiresAt: rows[0].expires_at instanceof Date ? rows[0].expires_at.toISOString() : rows[0].expires_at, purpose: rows[0].purpose } : null;
 }
 
 async function clearOtp(email) {
   if (!process.env.DATABASE_URL) {
-    memoryOtps.delete(email);
+    clearMemoryOtpsForEmail(email);
     return;
   }
   await ensureAuthTables();
   await query("delete from auth_otps where email = $1", [email]);
+}
+
+function otpKey(email, purpose) {
+  return `${purpose}:${email}`;
+}
+
+function clearMemoryOtpsForEmail(email) {
+  for (const key of memoryOtps.keys()) {
+    if (key.endsWith(`:${email}`)) memoryOtps.delete(key);
+  }
 }
 
 async function ensureAuthTables() {
@@ -445,11 +512,13 @@ async function ensureAuthTables() {
   await query(
     `create table if not exists auth_otps(
       email text primary key,
+      purpose text not null default 'login',
       otp_hash text not null,
       expires_at timestamptz not null,
       updated_at timestamptz not null default now()
     )`
   );
+  await query("alter table auth_otps add column if not exists purpose text not null default 'login'");
   authTablesReady = true;
 }
 

@@ -74,6 +74,44 @@ test("email auth, guest auth, session restore, otp, google login, and duplicate 
   });
   assert.equal(oldHandleReuse.status, 200);
 
+  const signupOtpEmail = `signup_${suffix}@example.com`;
+  const signupOtp = await postJson(baseUrl, "/api/auth/register/request", {
+    name: `Signup ${suffix}`,
+    username: `signup_${suffix}`,
+    email: signupOtpEmail,
+    password: "otp-password-1",
+    country: "IN"
+  });
+  assert.equal(signupOtp.status, 200);
+  assert.equal(signupOtp.body.purpose, "signup");
+  assert.match(signupOtp.body.devOtp, /^\d{6}$/);
+  const signupVerified = await postJson(baseUrl, "/api/auth/register/verify", {
+    name: `Signup ${suffix}`,
+    username: `signup_${suffix}`,
+    email: signupOtpEmail,
+    password: "otp-password-1",
+    code: signupOtp.body.devOtp,
+    country: "IN"
+  });
+  assert.equal(signupVerified.status, 200);
+  assert.equal(signupVerified.body.profile.handle, `signup_${suffix}`);
+
+  const resetOtp = await postJson(baseUrl, "/api/auth/password/reset/request", { email });
+  assert.equal(resetOtp.status, 200);
+  assert.equal(resetOtp.body.purpose, "password_reset");
+  assert.match(resetOtp.body.devOtp, /^\d{6}$/);
+  const resetLogin = await postJson(baseUrl, "/api/auth/password/reset/verify", {
+    email,
+    code: resetOtp.body.devOtp,
+    password: "new-strong-password-1"
+  });
+  assert.equal(resetLogin.status, 200);
+  assert.equal(resetLogin.body.profile.id, registered.body.profile.id);
+  const oldPasswordLogin = await postJson(baseUrl, "/api/auth/login", { email, password: "strong-password-1" });
+  assert.equal(oldPasswordLogin.status, 401);
+  const newPasswordLogin = await postJson(baseUrl, "/api/auth/login", { email, password: "new-strong-password-1" });
+  assert.equal(newPasswordLogin.status, 200);
+
   const search = await getJson(baseUrl, `/api/profile/search?q=${encodeURIComponent(username.slice(0, 8))}&limit=5`, login.body.token);
   assert.equal(search.status, 200);
   assert.ok(search.body.players.some((player) => player.handle === username));
