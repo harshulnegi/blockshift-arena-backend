@@ -109,17 +109,49 @@ export async function loginGoogleAccount({ idToken, name, username, handle, coun
   return { account, profile };
 }
 
-export async function loginGuestAccount({ deviceId, country = "GLOBAL" }) {
+export async function bindGoogleAccount({ user, idToken, country = "GLOBAL" }) {
+  if (!user?.id) throw authError(401, "unauthorized");
+  const account = await findAccountById(user.id);
+  if (!account) throw authError(401, "account_not_found");
+  const google = await verifyGoogleToken(idToken);
+  const email = assertEmail(google.email);
+  const existingByGoogle = google.subject ? await findAccountByGoogleSubject(google.subject) : null;
+  const existingByEmail = await findAccountByEmail(email);
+  const conflicting = [existingByGoogle, existingByEmail].find((existing) => existing && existing.id !== account.id);
+  if (conflicting) throw authError(409, "google_account_in_use");
+  const updated = await updateAccount(account.id, {
+    email,
+    googleSubject: google.subject || account.googleSubject,
+    providers: uniqueProviders([...account.providers, "google"])
+  });
+  const profile = (await findProfile(updated.id)) || (await upsertProfile({ id: updated.id, handle: updated.handle, name: updated.name, country }));
+  return { account: updated, profile };
+}
+
+export async function loginGuestAccount({ deviceId, name, username, handle, country = "GLOBAL" }) {
   const guestDeviceId = cleanGuestDeviceId(deviceId);
   const guestSubject = `guest:${guestDeviceId}`;
   const existing = await findAccountByGuestSubject(guestSubject);
+  const requestedHandle = cleanAuthHandle(username || handle || "");
+  const requestedName = cleanDisplayName(name || requestedHandle || "");
   if (existing) {
-    const profile = (await findProfile(existing.id)) || (await upsertProfile({ id: existing.id, handle: existing.handle, name: existing.name, country }));
-    return { account: existing, profile };
+    const nextHandle = requestedHandle && requestedHandle !== "neonpilot" ? assertHandle(requestedHandle) : existing.handle;
+    if (nextHandle !== existing.handle) await assertUniqueHandle(nextHandle, existing.id);
+    const nextName = requestedName && requestedName !== "Neon Pilot" ? requestedName : existing.name;
+    const updated = nextHandle !== existing.handle || nextName !== existing.name
+      ? await updateAccount(existing.id, { handle: nextHandle, name: nextName })
+      : existing;
+    const profile = await upsertProfile({ id: updated.id, handle: updated.handle, name: updated.name, country });
+    return { account: updated, profile };
   }
 
-  const accountHandle = await uniqueHandle(`guest${randomInt(1000, 9999)}`);
-  const accountName = cleanDisplayName(`Guest ${accountHandle.replace(/^guest/i, "") || "Player"}`);
+  const accountHandle = requestedHandle && requestedHandle !== "neonpilot"
+    ? assertHandle(requestedHandle)
+    : await uniqueHandle(`guest${randomInt(1000, 9999)}`);
+  await assertUniqueHandle(accountHandle);
+  const accountName = requestedName && requestedName !== "Neon Pilot"
+    ? requestedName
+    : cleanDisplayName(`Guest ${accountHandle.replace(/^guest/i, "") || "Player"}`);
   const account = await createAccount({
     id: newPlayerId(),
     email: guestEmailForDeviceId(guestDeviceId),
@@ -435,6 +467,12 @@ async function updateAccount(id, patch) {
   if (!current) throw authError(401, "account_not_found");
   const next = normalizeAccount({ ...current, ...patch, updatedAt: new Date().toISOString() });
   if (!process.env.DATABASE_URL) {
+    if ([...memoryAccounts.values()].some((existing) => existing.email === next.email && existing.id !== next.id)) {
+      throw authError(409, "email_in_use");
+    }
+    if ([...memoryAccounts.values()].some((existing) => existing.handle.toLowerCase() === next.handle.toLowerCase() && existing.id !== next.id)) {
+      throw authError(409, "handle_in_use");
+    }
     memoryAccounts.set(next.id, next);
     await saveMemoryAccounts();
     return next;
@@ -442,10 +480,10 @@ async function updateAccount(id, patch) {
   await ensureAuthTables();
   const { rows } = await query(
     `update auth_accounts
-     set handle = $2, handle_lower = $3, name = $4, password_hash = $5, google_subject = $6, guest_subject = $7, providers = $8, updated_at = now()
+     set email = $2, handle = $3, handle_lower = $4, name = $5, password_hash = $6, google_subject = $7, guest_subject = $8, providers = $9, updated_at = now()
      where id = $1
      returning *`,
-    [next.id, next.handle, next.handle.toLowerCase(), next.name, next.passwordHash || null, next.googleSubject || null, next.guestSubject || null, JSON.stringify(next.providers)]
+    [next.id, next.email, next.handle, next.handle.toLowerCase(), next.name, next.passwordHash || null, next.googleSubject || null, next.guestSubject || null, JSON.stringify(next.providers)]
   );
   return toAccount(rows[0]);
 }

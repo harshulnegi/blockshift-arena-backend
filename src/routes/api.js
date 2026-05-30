@@ -6,6 +6,7 @@ import { detectCountryFromRequest, resolveProfileCountry } from "../services/geo
 import { cachedHiveSnapshot, hiveStats, publicHiveEdge } from "../services/hive.js";
 import {
   assertProfileHandleAvailable,
+  bindGoogleAccount,
   cleanAuthHandle,
   deleteAccount,
   loginGuestAccount,
@@ -67,6 +68,16 @@ export function createApiRouter() {
     try {
       const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
       const { profile } = await loginGoogleAccount({ ...req.body, country });
+      sendAuth(res, profile);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  router.post("/auth/google/bind", requireAuth, async (req, res) => {
+    try {
+      const country = resolveProfileCountry(req, req.body.country, req.body.localeCountry);
+      const { profile } = await bindGoogleAccount({ user: req.user, idToken: req.body.idToken, country });
       sendAuth(res, profile);
     } catch (error) {
       sendAuthError(res, error);

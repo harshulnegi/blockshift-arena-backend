@@ -141,11 +141,14 @@ test("email auth, guest auth, session restore, otp, google login, and duplicate 
 
   const guestLogin = await postJson(baseUrl, "/api/auth/guest", {
     deviceId: `device_${suffix}`,
+    name: `Guest Hero ${suffix}`,
+    username: `gh_${suffix}`,
     country: "IN"
   });
   assert.equal(guestLogin.status, 200);
   assert.ok(guestLogin.body.token);
-  assert.match(guestLogin.body.profile.handle, /^guest/);
+  assert.equal(guestLogin.body.profile.handle, `gh_${suffix}`);
+  assert.equal(guestLogin.body.profile.name, `Guest Hero ${suffix}`);
   assert.equal(guestLogin.body.profile.rating, 100);
   assert.equal(guestLogin.body.profile.country, "IN");
 
@@ -155,10 +158,29 @@ test("email auth, guest auth, session restore, otp, google login, and duplicate 
 
   const sameGuest = await postJson(baseUrl, "/api/auth/guest", {
     deviceId: `device_${suffix}`,
+    name: `Guest Renamed ${suffix}`,
+    username: `gr_${suffix}`,
     country: "IN"
   });
   assert.equal(sameGuest.status, 200);
   assert.equal(sameGuest.body.profile.id, guestLogin.body.profile.id);
+  assert.equal(sameGuest.body.profile.handle, `gr_${suffix}`);
+  assert.equal(sameGuest.body.profile.name, `Guest Renamed ${suffix}`);
+
+  const guestBind = await postJson(baseUrl, "/api/auth/google/bind", {
+    idToken: `dev-google:bound_${suffix}@example.com`
+  }, sameGuest.body.token);
+  assert.equal(guestBind.status, 200);
+  assert.equal(guestBind.body.profile.id, guestLogin.body.profile.id);
+  assert.equal(guestBind.body.profile.handle, `gr_${suffix}`);
+
+  const boundGoogleLogin = await postJson(baseUrl, "/api/auth/google", {
+    idToken: `dev-google:bound_${suffix}@example.com`,
+    name: `Bound ${suffix}`,
+    username: `bound_${suffix}`
+  });
+  assert.equal(boundGoogleLogin.status, 200);
+  assert.equal(boundGoogleLogin.body.profile.id, guestLogin.body.profile.id);
 });
 
 async function postJson(baseUrl, path, body, token = "") {
